@@ -67,6 +67,10 @@ def analyze_response(response, baseline_text) -> int:
         logging.warning(f"Non-200 status code received.  Possible SSRF Indicator. Status Code: {response.status_code}")
         indicators += 1
     for marker in SSRF_MARKERS:
+        # The nested test makes the outer one stricter than it reads: with
+        # no baseline, a marker passes the outer condition and then counts
+        # for nothing, because the inner branch requires a baseline. Only
+        # the non 200 warning above can fire on a baseline free run.
         if marker in response.text and (baseline_text is None or marker not in baseline_text):
             if baseline_text is not None:
                 logging.warning(f"{marker} found in the fuzzed response but not in the baseline. Possible SSRF Indicator.")
@@ -98,6 +102,9 @@ def fuzz_url_params(url: str, params_to_fuzz: List[str] = None, timeout: int = 5
         payloads = SSRF_PAYLOADS
     sent = completed = indicators = 0
     parsed_url = urllib.parse.urlparse(url)
+    # parse_qs drops blank values, as in the other scanners: a parameter
+    # written ?next= with nothing after it cannot be fuzzed from the URL
+    # mode, and naming it with -p filters it out as not found.
     query_params = urllib.parse.parse_qs(parsed_url.query)
 
     if not query_params:
@@ -151,6 +158,9 @@ def fuzz_request_body(url: str, data: str, method: str = "POST", headers: Dict[s
         logging.error("The request body does not contain the 'PAYLOAD' marker. Exiting.")
         return sent, completed, indicators
 
+    # The body baseline sends the data with the PAYLOAD word still in it.
+    # If the server echoes that request body, the literal marker text is
+    # what later responses are compared against, not a clean page.
     baseline_text = None
     try:
         baseline = requests.request(method, url, data=data, headers=headers, timeout=timeout)
@@ -159,6 +169,8 @@ def fuzz_request_body(url: str, data: str, method: str = "POST", headers: Dict[s
         logging.warning(f"Baseline request failed: {e}. Marker findings require a baseline and will not be reported.")
 
     for payload in payloads:
+        # replace() takes every occurrence, so a body that uses PAYLOAD
+        # twice, once as a decoy, sends the payload in both places.
         fuzzed_data = data.replace("PAYLOAD", payload)
         logging.info(f"Fuzzing data: {fuzzed_data}")
         sent += 1
