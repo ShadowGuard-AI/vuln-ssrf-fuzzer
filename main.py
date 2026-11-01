@@ -9,15 +9,28 @@ from typing import List, Dict, Tuple
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# SSRF Payloads - Internal IP Addresses, Blocked External Sites
+# Default SSRF payloads: loopback and internal metadata destinations only.
+# These are the stated purpose of an SSRF fuzzer and are listed in full in
+# the README. Nothing outside loopback and internal shapes is in the
+# default set: reaching an external host requires the operator to name it,
+# either with --payloads or with --include-external.
 SSRF_PAYLOADS: List[str] = [
     "http://127.0.0.1",
     "http://localhost",
     "http://169.254.169.254",  # AWS Metadata
     "http://metadata.google.internal", # GCP Metadata
-    "http://example.com",  # Blocked external site example
     "http://0.0.0.0"
 ]
+
+# External payloads, sent only when the operator passes --include-external.
+EXTERNAL_PAYLOADS: List[str] = [
+    "http://example.com"
+]
+
+# Body substrings treated as possible SSRF evidence only when they appear
+# in a fuzzed response and were absent from the baseline response.
+SSRF_MARKERS = ["Example Domain", "127.0.0.1"]
+
 
 def setup_argparse() -> argparse.ArgumentParser:
     """
@@ -33,101 +46,133 @@ def setup_argparse() -> argparse.ArgumentParser:
     parser.add_argument("-H", "--headers", nargs='+', help="Custom headers to include in the request (e.g., 'Content-Type: application/json').")
     parser.add_argument("-m", "--method", default="GET", choices=["GET", "POST"], help="HTTP method to use (default: GET).")
     parser.add_argument("-t", "--timeout", type=int, default=5, help="Request timeout in seconds (default: 5).")
+    parser.add_argument("-P", "--payloads", nargs='+', default=None, help="Operator supplied payload list to use instead of the default set.")
+    parser.add_argument("--include-external", action="store_true", help="Also send the external payload set (http://example.com). Off by default: external destinations are sent only when the operator names them.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (debug logging).")
     return parser
 
 
-def fuzz_url_params(url: str, params_to_fuzz: List[str] = None, timeout: int = 5) -> None:
+def analyze_response(response, baseline_text) -> int:
     """
-    Fuzzes URL parameters with SSRF payloads.
+    Analyze one received response. Error responses are analyzed like any
+    other response, since they carry SSRF evidence. A body marker counts
+    only when it was absent from the baseline response, so a page that
+    merely contains the marker text is not a finding.
 
-    Args:
-        url (str): The URL to fuzz.
-        params_to_fuzz (List[str], optional): A list of parameters to specifically fuzz. If None, all query parameters are fuzzed. Defaults to None.
-        timeout (int, optional): Request timeout in seconds. Defaults to 5.
+    Returns:
+        int: The number of indicator warnings raised for this response.
     """
+    indicators = 0
+    if response.status_code != 200:
+        logging.warning(f"Non-200 status code received.  Possible SSRF Indicator. Status Code: {response.status_code}")
+        indicators += 1
+    for marker in SSRF_MARKERS:
+        if marker in response.text and (baseline_text is None or marker not in baseline_text):
+            if baseline_text is not None:
+                logging.warning(f"{marker} found in the fuzzed response but not in the baseline. Possible SSRF Indicator.")
+                indicators += 1
+    return indicators
+
+
+def fetch_baseline_url(url, method, headers, timeout):
+    """Fetch the unmodified target URL as the baseline. Returns body text or None."""
     try:
-        parsed_url = urllib.parse.urlparse(url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
+        response = requests.request(method, url, headers=headers, timeout=timeout)
+        return response.text
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Baseline request failed: {e}. Marker findings require a baseline and will not be reported.")
+        return None
 
-        if not query_params:
-            logging.info("No query parameters found in the URL.")
-            return
 
-        if params_to_fuzz:
-            params_to_fuzz = [param.strip() for param in params_to_fuzz]
-            params_to_fuzz = [param for param in params_to_fuzz if param in query_params]
-            if not params_to_fuzz:
-                logging.warning("Specified parameters not found in URL. Exiting.")
-                return
-        else:
-            params_to_fuzz = list(query_params.keys())  # Fuzz all if none provided.
+def fuzz_url_params(url: str, params_to_fuzz: List[str] = None, timeout: int = 5,
+                    method: str = "GET", headers: Dict[str, str] = None,
+                    payloads: List[str] = None) -> Tuple[int, int, int]:
+    """
+    Fuzzes URL parameters with SSRF payloads, honoring the method and
+    headers the operator supplied.
 
-        for param in params_to_fuzz:
-            for payload in SSRF_PAYLOADS:
-                fuzzed_query_params = query_params.copy()
-                fuzzed_query_params[param] = [payload]
-                encoded_query_string = urllib.parse.urlencode(fuzzed_query_params, doseq=True)
-                fuzzed_url = parsed_url._replace(query=encoded_query_string).geturl()
+    Returns:
+        tuple: (sent, completed, indicators) counts for the run summary.
+    """
+    if payloads is None:
+        payloads = SSRF_PAYLOADS
+    sent = completed = indicators = 0
+    parsed_url = urllib.parse.urlparse(url)
+    query_params = urllib.parse.parse_qs(parsed_url.query)
 
-                logging.info(f"Fuzzing URL: {fuzzed_url}")
-                try:
-                    response = requests.get(fuzzed_url, timeout=timeout)
-                    response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-                    logging.info(f"Response Status Code: {response.status_code}")
-                    #Example Response Analysis
-                    if response.status_code != 200:
-                        logging.warning(f"Non-200 status code received.  Possible SSRF Indicator. Status Code: {response.status_code}")
-                    if "Example Domain" in response.text:
-                        logging.warning(f"Example Domain found. Possible SSRF Indicator.")
-                    if "127.0.0.1" in response.text:
-                         logging.warning(f"Localhost found. Possible SSRF Indicator.")
-                    # Add more response analysis here
-                except requests.exceptions.RequestException as e:
-                    logging.error(f"Request failed: {e}")
+    if not query_params:
+        logging.info("No query parameters found in the URL.")
+        return sent, completed, indicators
 
-    except Exception as e:
-        logging.error(f"An error occurred while fuzzing URL parameters: {e}")
+    if params_to_fuzz:
+        params_to_fuzz = [param.strip() for param in params_to_fuzz]
+        params_to_fuzz = [param for param in params_to_fuzz if param in query_params]
+        if not params_to_fuzz:
+            logging.warning("Specified parameters not found in URL. Exiting.")
+            return sent, completed, indicators
+    else:
+        params_to_fuzz = list(query_params.keys())  # Fuzz all if none provided.
 
-def fuzz_request_body(url: str, data: str, method: str = "POST", headers: Dict[str, str] = None, timeout: int = 5) -> None:
+    baseline_text = fetch_baseline_url(url, method, headers, timeout)
+
+    for param in params_to_fuzz:
+        for payload in payloads:
+            fuzzed_query_params = query_params.copy()
+            fuzzed_query_params[param] = [payload]
+            encoded_query_string = urllib.parse.urlencode(fuzzed_query_params, doseq=True)
+            fuzzed_url = parsed_url._replace(query=encoded_query_string).geturl()
+
+            logging.info(f"Fuzzing URL: {fuzzed_url}")
+            sent += 1
+            try:
+                # No raise_for_status: error responses are analyzed too.
+                response = requests.request(method, fuzzed_url, headers=headers, timeout=timeout)
+                completed += 1
+                logging.info(f"Response Status Code: {response.status_code}")
+                indicators += analyze_response(response, baseline_text)
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Request failed: {e}")
+    return sent, completed, indicators
+
+
+def fuzz_request_body(url: str, data: str, method: str = "POST", headers: Dict[str, str] = None,
+                      timeout: int = 5, payloads: List[str] = None) -> Tuple[int, int, int]:
     """
     Fuzzes the request body with SSRF payloads.  Looks for the "PAYLOAD" marker.
+    The fuzzed data is sent as the request body for both GET and POST.
 
-    Args:
-        url (str): The URL to send the request to.
-        data (str): The request body data containing the "PAYLOAD" marker.
-        method (str, optional): The HTTP method to use (default: POST).
-        headers (Dict[str, str], optional): Custom headers to include (default: None).
-        timeout (int, optional): Request timeout in seconds. Defaults to 5.
+    Returns:
+        tuple: (sent, completed, indicators) counts for the run summary.
     """
+    if payloads is None:
+        payloads = SSRF_PAYLOADS
+    sent = completed = indicators = 0
     if "PAYLOAD" not in data:
         logging.error("The request body does not contain the 'PAYLOAD' marker. Exiting.")
-        return
+        return sent, completed, indicators
 
-    for payload in SSRF_PAYLOADS:
+    baseline_text = None
+    try:
+        baseline = requests.request(method, url, data=data, headers=headers, timeout=timeout)
+        baseline_text = baseline.text
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Baseline request failed: {e}. Marker findings require a baseline and will not be reported.")
+
+    for payload in payloads:
         fuzzed_data = data.replace("PAYLOAD", payload)
         logging.info(f"Fuzzing data: {fuzzed_data}")
+        sent += 1
         try:
-            if method == "GET":
-                response = requests.get(url, params=fuzzed_data, headers=headers, timeout=timeout)
-            else: # POST
-                response = requests.post(url, data=fuzzed_data, headers=headers, timeout=timeout)
-
-            response.raise_for_status()
+            response = requests.request(method, url, data=fuzzed_data, headers=headers, timeout=timeout)
+            completed += 1
             logging.info(f"Response Status Code: {response.status_code}")
-            #Example Response Analysis
-            if response.status_code != 200:
-                logging.warning(f"Non-200 status code received.  Possible SSRF Indicator. Status Code: {response.status_code}")
-            if "Example Domain" in response.text:
-                logging.warning(f"Example Domain found. Possible SSRF Indicator.")
-            if "127.0.0.1" in response.text:
-                 logging.warning(f"Localhost found. Possible SSRF Indicator.")
-             # Add more response analysis here
-
+            indicators += analyze_response(response, baseline_text)
         except requests.exceptions.RequestException as e:
             logging.error(f"Request failed: {e}")
         except Exception as e:
             logging.error(f"An error occurred while fuzzing the request body: {e}")
+    return sent, completed, indicators
+
 
 def parse_headers(headers: List[str]) -> Dict[str, str]:
     """Parses a list of header strings into a dictionary.
@@ -148,6 +193,7 @@ def parse_headers(headers: List[str]) -> Dict[str, str]:
                 logging.error(f"Invalid header format: {header}. Expected 'Header-Name: Header-Value'. Ignoring.")
     return header_dict
 
+
 def main():
     """
     Main function of the vuln-SSRF-Fuzzer tool.
@@ -160,15 +206,32 @@ def main():
 
     logging.debug(f"Arguments: {args}")
 
+    if args.payloads:
+        payloads = list(args.payloads)
+    else:
+        payloads = list(SSRF_PAYLOADS)
+    if args.include_external:
+        payloads += EXTERNAL_PAYLOADS
+
+    headers = parse_headers(args.headers) if args.headers else None
+
     try:
         if args.data:
-            headers = parse_headers(args.headers) if args.headers else None
-            fuzz_request_body(args.url, args.data, args.method, headers, args.timeout)
+            sent, completed, indicators = fuzz_request_body(
+                args.url, args.data, args.method, headers, args.timeout, payloads)
         else:
-            fuzz_url_params(args.url, args.params, args.timeout)
+            sent, completed, indicators = fuzz_url_params(
+                args.url, args.params, args.timeout, args.method, headers, payloads)
     except Exception as e:
         logging.error(f"An unhandled error occurred: {e}")
         sys.exit(1)
+
+    failed = sent - completed
+    logging.info(f"Summary: requests sent: {sent}, completed: {completed}, failed: {failed}, indicators: {indicators}")
+    if completed == 0:
+        logging.error("No fuzz request completed. The run is inconclusive.")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
