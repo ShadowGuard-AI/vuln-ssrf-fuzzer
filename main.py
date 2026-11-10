@@ -216,6 +216,14 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    if not args.url.lower().startswith(("http://", "https://")):
+        logging.error("Invalid input: URL must start with http:// or https://")
+        sys.exit(1)
+
+    if args.timeout <= 0:
+        logging.error("Invalid input: --timeout must be greater than 0.")
+        sys.exit(1)
+
     logging.debug(f"Arguments: {args}")
 
     if args.payloads:
